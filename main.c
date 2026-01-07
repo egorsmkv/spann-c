@@ -1,5 +1,7 @@
-// clang -std=c23 -O3 -march=native -fno-math-errno -fno-trapping-math -flto
-// -mtune=native -mavx2 -mfma main.c l2_kernel.o -o spann_demo -lm
+/*
+clang -std=c23 -O3 -march=native -fno-math-errno -fno-trapping-math -flto \
+  -mtune=native -mavx2 -mfma main.c l2_kernel.o -o spann_demo -lm
+*/
 
 #include <math.h>
 #include <stdckdint.h>
