@@ -20,6 +20,22 @@ clang -O3 -mavx2 -mfma main.c l2_kernel.o -o spann_demo -lm
 ./spann_demo
 ```
 
+```
+--- SPANN Optimized (AVX2) 5M Vector Demo ---
+Target: 5,000,000 Vectors
+Estimated Disk Usage: ~2.56 GB
+
+Detected existing data file: spann_5m_data.bin. Loading metadata...
+Metadata loaded successfully. Skipping data generation.
+
+Executing search against 5M vectors (Disk-Resident)...
+
+Search Results:
+Nearest Neighbor ID: 47048
+L2 Distance:         16.628300
+Total Latency:       63.722 ms
+```
+
 ## Notes
 - First run will generate `spann_5m_data.bin` (~2.56 GB). Subsequent runs reuse it.
 - The demo parameters are in `main.c` (dim=128, centroids=100, 50k vectors per list).
