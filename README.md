@@ -12,7 +12,7 @@ Requires `clang` and `nasm` with AVX2 support.
 
 ```bash
 nasm -f elf64 -O3 l2_kernel.asm -o l2_kernel.o
-clang -O3 -march=native -fno-math-errno -fno-trapping-math -flto -mtune=native -mavx2 -mfma main.c l2_kernel.o -o spann_demo -lm
+clang -std=c23 -O3 -march=native -fno-math-errno -fno-trapping-math -flto -mtune=native -mavx2 -mfma main.c l2_kernel.o -o spann_demo -lm
 ```
 
 ## Run

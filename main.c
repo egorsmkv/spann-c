@@ -1,17 +1,22 @@
-// nasm -f elf64 -O3 l2_kernel.asm -o l2_kernel.o
-// clang -std=c17 -O3 -march=native -fno-math-errno -fno-trapping-math -flto
+// clang -std=c23 -O3 -march=native -fno-math-errno -fno-trapping-math -flto
 // -mtune=native -mavx2 -mfma main.c l2_kernel.o -o spann_demo -lm
 
 #include <math.h>
-#include <stdbool.h>
+#include <stdckdint.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-/* Assembly Prototype for high-performance L2 distance */
-extern float l2_sq_dist_avx2(uint32_t dim, const float *a, const float *b);
+/* Validates 64-bit long for fseek > 2GB support (LP64 data model) */
+static_assert(
+    sizeof(long) >= 8,
+    "This program requires 64-bit long (LP64) to handle >2GB files via fseek.");
+
+/* 'restrict' used to indicate arrays do not overlap, enabling optimization. */
+extern float l2_sq_dist_avx2(uint32_t dim, const float *restrict a,
+                             const float *restrict b);
 
 typedef struct {
   float *coordinates;
@@ -38,12 +43,13 @@ typedef struct {
 
 /**
  * Selects the most promising posting lists based on the query vector.
- * Limits disk access to the 'top' candidates to maintain low latency.
  */
-static size_t select_posting_lists(const spann_index_t *index,
-                                   const vector_t *query, const float epsilon_2,
-                                   uint32_t *active_indices,
-                                   float *centroid_dists,
+[[nodiscard]]
+static size_t select_posting_lists(const spann_index_t *restrict index,
+                                   const vector_t *restrict query,
+                                   const float epsilon_2,
+                                   uint32_t *restrict active_indices,
+                                   float *restrict centroid_dists,
                                    const size_t max_candidates) {
   if (index->num_centroids == 0) {
     return 0;
@@ -59,7 +65,7 @@ static size_t select_posting_lists(const spann_index_t *index,
     }
   }
 
-  float threshold = (1.0f + epsilon_2) * (1.0f + epsilon_2) * min_dist;
+  const float threshold = (1.0f + epsilon_2) * (1.0f + epsilon_2) * min_dist;
   size_t active_count = 0;
 
   for (uint32_t i = 0;
@@ -74,36 +80,56 @@ static size_t select_posting_lists(const spann_index_t *index,
 /**
  * SPANN Search Core: Scans disk-resident vectors within selected clusters.
  */
-neighbor_t search_spann(const spann_index_t *index, const vector_t *query,
-                        const float epsilon_2) {
+[[nodiscard]]
+neighbor_t search_spann(const spann_index_t *restrict index,
+                        const vector_t *restrict query, const float epsilon_2) {
   neighbor_t best_neighbor = {0, INFINITY};
 
-  /* Allocate temporary storage for centroid distances to avoid VLA usage */
-  float *centroid_dists = malloc((size_t)index->num_centroids * sizeof(float));
+  /* Checked allocation size calculation */
+  size_t dists_size;
+  if (ckd_mul(&dists_size, (size_t)index->num_centroids, sizeof(float))) {
+    perror("Integer overflow in centroid distance allocation");
+    return best_neighbor;
+  }
+
+  float *centroid_dists = malloc(dists_size);
   if (!centroid_dists) {
     perror("Failed to allocate centroid distance buffer");
     return best_neighbor;
   }
 
   uint32_t active_lists[32];
-  /* Limit to top 32 lists for search efficiency */
   size_t num_lists = select_posting_lists(index, query, epsilon_2, active_lists,
                                           centroid_dists, 32);
   free(centroid_dists);
 
+  /* Use const instead of constexpr for compatibility */
   const uint32_t block_vectors = 256;
-  const size_t block_floats = (size_t)block_vectors * index->dimension;
-  const size_t buffer_size = block_floats * sizeof(float);
+
+  size_t block_floats;
+  if (ckd_mul(&block_floats, (size_t)block_vectors, (size_t)index->dimension)) {
+    perror("Overflow in block size calculation");
+    return best_neighbor;
+  }
+
+  size_t buffer_size;
+  if (ckd_mul(&buffer_size, block_floats, sizeof(float))) {
+    perror("Overflow in buffer size calculation");
+    return best_neighbor;
+  }
+
   const size_t alignment = 32;
 
-  /* * C17 aligned_alloc: size must be a multiple of alignment.
-   * 32-byte alignment is required for AVX2.
-   * buffer_size is (256 * dim * 4). If dim is even, buffer_size % 32 == 0.
-   * We assume dim=128 from main, so 128*256*4 = 131072, which is valid.
-   */
+  /* C23 aligned_alloc requirements: size must be a multiple of alignment. */
+  if (buffer_size % alignment != 0) {
+    fprintf(stderr,
+            "Error: Buffer size %zu is not a multiple of alignment %zu\n",
+            buffer_size, alignment);
+    return best_neighbor;
+  }
+
   float *buffer = aligned_alloc(alignment, buffer_size);
   if (!buffer) {
-    /* Fallback to standard malloc if aligned_alloc fails (rare) */
     buffer = malloc(buffer_size);
   }
   if (!buffer) {
@@ -113,13 +139,10 @@ neighbor_t search_spann(const spann_index_t *index, const vector_t *query,
 
   for (size_t i = 0; i < num_lists; ++i) {
     const posting_meta_t *meta = &index->centroids[active_lists[i]];
-    const uint64_t list_base_id =
-        meta->disk_offset / (index->dimension * sizeof(float));
 
-    /* * Note: fseek takes a 'long'. On LLP64 (Windows), this is 32-bit (2GB
-     * max). On LP64 (Linux), it is 64-bit. Since input uses ELF64/AVX, we
-     * assume LP64.
-     */
+    const uint64_t list_base_id =
+        meta->disk_offset / ((size_t)index->dimension * sizeof(float));
+
     if (fseek(index->posting_file, (long)meta->disk_offset, SEEK_SET) != 0) {
       perror("Seek failed");
       continue;
@@ -174,8 +197,7 @@ void destroy_index(spann_index_t *index) {
 }
 
 int main(void) {
-  /* SCALE: 5 Million Vectors */
-  /* File size will be approx 2.56 GB (128 dims * 4 bytes * 5M) */
+  /* Use const instead of constexpr */
   const uint32_t dim = 128;
   const uint32_t num_centroids = 100;
   const uint32_t vectors_per_list = 50000;
@@ -188,7 +210,7 @@ int main(void) {
   spann_index_t *index = calloc(1, sizeof(spann_index_t));
   if (!index) {
     perror("Failed to allocate index");
-    return 1;
+    return EXIT_FAILURE;
   }
 
   index->dimension = dim;
@@ -197,13 +219,16 @@ int main(void) {
   if (!index->centroids) {
     perror("Failed to allocate centroids");
     free(index);
-    return 1;
+    return EXIT_FAILURE;
   }
 
   /* Check if the file already exists */
+  bool file_exists = false;
+
+  /* Moved declaration out of condition for compatibility */
   FILE *exists_check = fopen(posting_filename, "rb");
-  bool file_exists = (exists_check != NULL);
-  if (file_exists) {
+  if (exists_check) {
+    file_exists = true;
     fclose(exists_check);
     printf("Detected existing data file: %s. Loading metadata...\n",
            posting_filename);
@@ -217,11 +242,11 @@ int main(void) {
   if (!index->posting_file) {
     perror("Failed to open file. Check disk space/permissions.");
     destroy_index(index);
-    return 1;
+    return EXIT_FAILURE;
   }
 
   /* Optimize I/O buffer */
-  if (setvbuf(index->posting_file, NULL, _IOFBF, 4 * 1024 * 1024) != 0) {
+  if (setvbuf(index->posting_file, nullptr, _IOFBF, 4 * 1024 * 1024) != 0) {
     perror("Warning: Failed to set file buffer");
   }
 
@@ -231,37 +256,44 @@ int main(void) {
   if (!temp_vec) {
     perror("Failed to allocate temp_vec");
     destroy_index(index);
-    return 1;
+    return EXIT_FAILURE;
   }
+
+  int exit_code = EXIT_SUCCESS;
 
   /* Initialization logic */
   for (uint32_t i = 0; i < num_centroids; ++i) {
     index->centroids[i].centroid.coordinates = malloc(dim * sizeof(float));
     if (!index->centroids[i].centroid.coordinates) {
       perror("Failed to allocate centroid coordinates");
-      /* Simple cleanup attempt, actual recovery is complex here */
-      free(temp_vec);
-      destroy_index(index);
-      return 1;
+      exit_code = EXIT_FAILURE;
+      goto cleanup_and_exit;
     }
 
     index->centroids[i].list_size = vectors_per_list;
-    index->centroids[i].disk_offset =
-        (uint64_t)i * vectors_per_list * dim * sizeof(float);
 
-    /* Deterministic random seed for centroids so they match across runs */
+    size_t offset_calc;
+    if (ckd_mul(&offset_calc, (size_t)i, (size_t)vectors_per_list) ||
+        ckd_mul(&offset_calc, offset_calc, (size_t)dim) ||
+        ckd_mul(&offset_calc, offset_calc, sizeof(float))) {
+      fprintf(stderr, "Overflow calculating disk offset\n");
+      exit_code = EXIT_FAILURE;
+      goto cleanup_and_exit;
+    }
+    index->centroids[i].disk_offset = (uint64_t)offset_calc;
+
     srand(i);
     for (uint32_t d = 0; d < dim; d++) {
       index->centroids[i].centroid.coordinates[d] =
           (float)rand() * inv_rand_max;
     }
 
-    /* Only write vectors if the file didn't exist */
     if (!file_exists) {
       if (fseek(index->posting_file, (long)index->centroids[i].disk_offset,
                 SEEK_SET) != 0) {
         perror("File seek error during generation");
-        break;
+        exit_code = EXIT_FAILURE;
+        goto cleanup_and_exit;
       }
 
       for (uint32_t v = 0; v < vectors_per_list; v++) {
@@ -272,7 +304,8 @@ int main(void) {
 
         if (fwrite(temp_vec, sizeof(float), dim, index->posting_file) != dim) {
           perror("File write error");
-          break;
+          exit_code = EXIT_FAILURE;
+          goto cleanup_and_exit;
         }
       }
 
@@ -292,9 +325,10 @@ int main(void) {
 
   fflush(index->posting_file);
   free(temp_vec);
+  temp_vec = nullptr;
 
   /* Create Query */
-  srand((unsigned int)time(NULL));
+  srand((unsigned int)time(nullptr));
   vector_t query;
   query.dimension = dim;
   query.coordinates = malloc(dim * sizeof(float));
@@ -320,9 +354,12 @@ int main(void) {
     free(query.coordinates);
   } else {
     perror("Failed to allocate query vector");
+    exit_code = EXIT_FAILURE;
   }
 
+cleanup_and_exit:
+  if (temp_vec)
+    free(temp_vec);
   destroy_index(index);
-
-  return 0;
+  return exit_code;
 }
