@@ -94,4 +94,5 @@ l2_sq_dist_avx2:
     jnz .scalar_loop
 
 .done:
+    vzeroupper
     ret

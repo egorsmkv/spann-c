@@ -1,5 +1,5 @@
 // nasm -f elf64 -O3 l2_kernel.asm -o l2_kernel.o
-// clang -O3 -mavx2 -mfma main.c l2_kernel.o -o spann_demo -lm
+// clang -O3 -march=native -fno-math-errno -fno-trapping-math -flto -mtune=native -mavx2 -mfma main.c l2_kernel.o -o spann_demo -lm
 
 #include <math.h>
 #include <stdbool.h>
@@ -41,6 +41,7 @@ typedef struct {
  */
 size_t select_posting_lists(const spann_index_t *index, const vector_t *query,
                             const float epsilon_2, uint32_t *active_indices,
+                            float *centroid_dists,
                             const size_t max_candidates) {
   if (index->num_centroids == 0)
     return 0;
@@ -49,6 +50,7 @@ size_t select_posting_lists(const spann_index_t *index, const vector_t *query,
   for (uint32_t i = 0; i < index->num_centroids; ++i) {
     float d = l2_sq_dist_avx2(index->dimension, query->coordinates,
                               index->centroids[i].centroid.coordinates);
+    centroid_dists[i] = d;
     if (d < min_dist)
       min_dist = d;
   }
@@ -58,9 +60,7 @@ size_t select_posting_lists(const spann_index_t *index, const vector_t *query,
 
   for (uint32_t i = 0;
        i < index->num_centroids && active_count < max_candidates; ++i) {
-    float d = l2_sq_dist_avx2(index->dimension, query->coordinates,
-                              index->centroids[i].centroid.coordinates);
-    if (d <= threshold)
+    if (centroid_dists[i] <= threshold)
       active_indices[active_count++] = i;
   }
   return active_count;
@@ -71,38 +71,59 @@ size_t select_posting_lists(const spann_index_t *index, const vector_t *query,
  */
 neighbor_t search_spann(const spann_index_t *index, const vector_t *query,
                         const float epsilon_2) {
-  uint32_t *active_lists = malloc(sizeof(uint32_t) * index->num_centroids);
+  uint32_t active_lists[32];
+  float centroid_dists[index->num_centroids];
   // Limit to top 32 lists for search efficiency
   size_t num_lists =
-      select_posting_lists(index, query, epsilon_2, active_lists, 32);
+      select_posting_lists(index, query, epsilon_2, active_lists,
+                           centroid_dists, 32);
 
   neighbor_t best_neighbor = {0, INFINITY};
-  float *buffer = malloc(index->dimension * sizeof(float));
+  const uint32_t block_vectors = 256;
+  const size_t block_floats = (size_t)block_vectors * index->dimension;
+  float *buffer = NULL;
+  if (posix_memalign((void **)&buffer, 32,
+                     block_floats * sizeof(float)) != 0) {
+    buffer = malloc(block_floats * sizeof(float));
+  }
+  if (!buffer) {
+    return best_neighbor;
+  }
 
   for (size_t i = 0; i < num_lists; ++i) {
     posting_meta_t *meta = &index->centroids[active_lists[i]];
+    const uint64_t list_base_id =
+        meta->disk_offset / (index->dimension * sizeof(float));
 
     // Seek to the specific block on disk
     fseek(index->posting_file, (long)meta->disk_offset, SEEK_SET);
 
-    for (uint32_t j = 0; j < meta->list_size; ++j) {
-      if (fread(buffer, sizeof(float), index->dimension, index->posting_file) !=
-          index->dimension)
-        continue;
+    uint32_t remaining = meta->list_size;
+    uint32_t list_offset = 0;
+    while (remaining > 0) {
+      uint32_t read_vectors =
+          remaining > block_vectors ? block_vectors : remaining;
+      size_t read_count =
+          fread(buffer, sizeof(float), (size_t)read_vectors * index->dimension,
+                index->posting_file);
+      if (read_count != (size_t)read_vectors * index->dimension)
+        break;
 
-      float d = l2_sq_dist_avx2(index->dimension, query->coordinates, buffer);
-      if (d < best_neighbor.distance) {
-        best_neighbor.distance = d;
-        // Calculate global ID based on disk offset and position
-        best_neighbor.id =
-            (uint32_t)(meta->disk_offset / (index->dimension * sizeof(float))) +
-            j;
+      for (uint32_t j = 0; j < read_vectors; ++j) {
+        float *vec = buffer + (size_t)j * index->dimension;
+        float d = l2_sq_dist_avx2(index->dimension, query->coordinates, vec);
+        if (d < best_neighbor.distance) {
+          best_neighbor.distance = d;
+          best_neighbor.id = (uint32_t)(list_base_id + list_offset + j);
+        }
       }
+
+      remaining -= read_vectors;
+      list_offset += read_vectors;
     }
   }
 
   free(buffer);
-  free(active_lists);
   return best_neighbor;
 }
 
@@ -152,6 +173,7 @@ int main(void) {
     perror("Failed to open file. Check disk space/permissions.");
     return 1;
   }
+  setvbuf(index->posting_file, NULL, _IOFBF, 4 * 1024 * 1024);
 
   srand(42);
   const float inv_rand_max = 1.0f / (float)RAND_MAX;
